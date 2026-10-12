@@ -1,0 +1,4 @@
+# テストとlintに必要なものだけ。音声機器・Whisper・OpenAI APIはテスト内で差し替える
+numpy
+pytest>=8
+ruff>=0.6
