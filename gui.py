@@ -1,213 +1,237 @@
+import queue
 import tkinter as tk
 from tkinter import ttk
-import asyncio
-import threading
-import pyautogui
-import pyperclip
-import keyboard
-from audio_processor import AudioProcessor
-from transcription_processor import APITranscriptionProcessor, LocalTranscriptionProcessor
-from config import ProcessingMode, WhisperModel, CONFIG_FILE
-from utils import load_config, save_config
+from typing import Any, Callable, Dict
+
+from config import (
+    DEFAULT_PROCESSING_MODE,
+    DEFAULT_SHORTCUT_KEY,
+    DEFAULT_WHISPER_MODEL,
+    ProcessingMode,
+    WhisperModel,
+)
+from recognition import LogEvent, RecognitionRequest, StoppedEvent, TranscribedEvent
+from utils import load_config, mask_api_key, save_config
+
+EVENT_POLL_INTERVAL_MS = 50
+AUDIO_RELEASE_TIMEOUT_SECONDS = 2.0
+
 
 class VoiceWriterGUI:
-    def __init__(self, master):
+    def __init__(
+        self,
+        master: tk.Misc,
+        audio_processor: Any,
+        session: Any,
+        processor_factory: Any,
+        events: "queue.Queue[Any]",
+        load_config: Callable[[], Dict[str, Any]] = load_config,
+        save_config: Callable[[Dict[str, Any]], None] = save_config,
+    ) -> None:
         self.master = master
         master.title("VoiceWriter")
-        
-        self.audioProcessor = AudioProcessor()
-        self.transcriptionProcessor = None
-        self.isRecording = False
+
+        self.audio_processor = audio_processor
+        self.session = session
+        self.processor_factory = processor_factory
+        self.events = events
+        self.save_config = save_config
+        self.is_recording = False
+        self.is_closed = False
 
         # 設定の読み込み
         self.config = load_config()
 
         # GUI要素の初期化
-        self.initializeGUIElements()
+        self.initialize_gui_elements()
 
-        # イベントループの設定
-        self.loop = asyncio.new_event_loop()
-        self.thread = threading.Thread(target=self.run_async_loop, daemon=True)
-        self.thread.start()
+        # ワーカースレッドからのイベントはメインスレッドで取り出して反映する
+        self.poll_job = master.after(EVENT_POLL_INTERVAL_MS, self.poll_events)
 
         # ウィンドウが閉じられる時の処理を設定
-        master.protocol("WM_DELETE_WINDOW", self.onClose)
+        master.protocol("WM_DELETE_WINDOW", self.on_close)
 
-    def initializeGUIElements(self):
+    def initialize_gui_elements(self) -> None:
         # 処理モード選択
         ttk.Label(self.master, text="処理モード:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
-        self.processingMode = tk.StringVar(value=self.config.get("processingMode", "cpu"))
-        self.processingModeCombo = ttk.Combobox(self.master, textvariable=self.processingMode, values=["api", "cpu", "cuda"], state="readonly")
-        self.processingModeCombo.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
-        self.processingModeCombo.bind("<<ComboboxSelected>>", self.onProcessingModeChange)
+        mode_values = [mode.value for mode in ProcessingMode]
+        self.processing_mode = tk.StringVar(
+            value=self._choice(self.config.get("processingMode"), mode_values, DEFAULT_PROCESSING_MODE.value)
+        )
+        self.processing_mode_combo = ttk.Combobox(
+            self.master, textvariable=self.processing_mode, values=mode_values, state="readonly"
+        )
+        self.processing_mode_combo.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
+        self.processing_mode_combo.bind("<<ComboboxSelected>>", self.on_processing_mode_change)
 
         # APIキー入力
         ttk.Label(self.master, text="OpenAIAPIキー:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
-        self.apiKey = tk.StringVar(value=self.config.get("apiKey", ""))
-        self.apiKeyEntry = ttk.Entry(self.master, textvariable=self.apiKey, show="*")
-        self.apiKeyEntry.grid(row=1, column=1, sticky="ew", padx=5, pady=5)
-        self.apiKeyEntry.config(state="normal" if self.processingMode.get() == "api" else "disabled")
+        self.api_key = tk.StringVar(value=str(self.config.get("apiKey", "")))
+        self.api_key_entry = ttk.Entry(self.master, textvariable=self.api_key, show="*")
+        self.api_key_entry.grid(row=1, column=1, sticky="ew", padx=5, pady=5)
 
         # Whisperモデル選択
         ttk.Label(self.master, text="Whisperモデル:").grid(row=2, column=0, sticky="w", padx=5, pady=5)
-        self.whisperModel = tk.StringVar(value=self.config.get("whisperModel", "medium"))
-        self.whisperModelCombo = ttk.Combobox(self.master, textvariable=self.whisperModel, values=[model.value for model in WhisperModel], state="readonly")
-        self.whisperModelCombo.grid(row=2, column=1, sticky="ew", padx=5, pady=5)
-        self.whisperModelCombo.config(state="normal" if self.processingMode.get() != "api" else "disabled")
+        model_values = [model.value for model in WhisperModel]
+        self.whisper_model = tk.StringVar(
+            value=self._choice(self.config.get("whisperModel"), model_values, DEFAULT_WHISPER_MODEL.value)
+        )
+        self.whisper_model_combo = ttk.Combobox(
+            self.master, textvariable=self.whisper_model, values=model_values, state="readonly"
+        )
+        self.whisper_model_combo.grid(row=2, column=1, sticky="ew", padx=5, pady=5)
 
         # マイク選択
         ttk.Label(self.master, text="マイク:").grid(row=3, column=0, sticky="w", padx=5, pady=5)
-        self.selectedMic = tk.StringVar(value=self.config.get("selectedMic", ""))
-        self.micCombo = ttk.Combobox(self.master, textvariable=self.selectedMic, values=self.audioProcessor.get_input_devices(), state="readonly")
-        self.micCombo.grid(row=3, column=1, sticky="ew", padx=5, pady=5)
+        mic_values = self.audio_processor.get_input_devices()
+        self.selected_mic = tk.StringVar(
+            value=self._choice(self.config.get("selectedMic"), mic_values, mic_values[0] if mic_values else "")
+        )
+        self.mic_combo = ttk.Combobox(self.master, textvariable=self.selected_mic, values=mic_values, state="readonly")
+        self.mic_combo.grid(row=3, column=1, sticky="ew", padx=5, pady=5)
 
         # ショートカットキー入力
         ttk.Label(self.master, text="ショートカットキー:").grid(row=4, column=0, sticky="w", padx=5, pady=5)
-        self.shortcutKey = tk.StringVar(value=self.config.get("shortcutKey", "ctrl+space"))
-        self.shortcutKeyEntry = ttk.Entry(self.master, textvariable=self.shortcutKey)
-        self.shortcutKeyEntry.grid(row=4, column=1, sticky="ew", padx=5, pady=5)
+        self.shortcut_key = tk.StringVar(value=str(self.config.get("shortcutKey", DEFAULT_SHORTCUT_KEY)))
+        self.shortcut_key_entry = ttk.Entry(self.master, textvariable=self.shortcut_key)
+        self.shortcut_key_entry.grid(row=4, column=1, sticky="ew", padx=5, pady=5)
 
         # 認識開始/終了ボタン
-        self.recognitionButton = ttk.Button(self.master, text="認識開始", command=self.toggleRecognition)
-        self.recognitionButton.grid(row=5, column=0, columnspan=2, pady=10)
+        self.recognition_button = ttk.Button(self.master, text="認識開始", command=self.toggle_recognition)
+        self.recognition_button.grid(row=5, column=0, columnspan=2, pady=10)
 
         # ログ表示エリア
         ttk.Label(self.master, text="ログ:").grid(row=6, column=0, columnspan=2, sticky="w", padx=5, pady=5)
-        self.logText = tk.Text(self.master, height=10, width=50, state="disabled")
-        self.logText.grid(row=7, column=0, columnspan=2, padx=5, pady=5, sticky="nsew")
+        self.log_text = tk.Text(self.master, height=10, width=50, state="disabled")
+        self.log_text.grid(row=7, column=0, columnspan=2, padx=5, pady=5, sticky="nsew")
 
         # 最新の文字起こし結果表示エリア
-        ttk.Label(self.master, text="最新の文字起こし結果:").grid(row=8, column=0, columnspan=2, sticky="w", padx=5, pady=5)
-        self.latestTranscriptionText = tk.Text(self.master, height=10, width=50)
-        self.latestTranscriptionText.grid(row=9, column=0, columnspan=2, padx=5, pady=5, sticky="nsew")
+        ttk.Label(self.master, text="最新の文字起こし結果:").grid(
+            row=8, column=0, columnspan=2, sticky="w", padx=5, pady=5
+        )
+        self.latest_transcription_text = tk.Text(self.master, height=10, width=50)
+        self.latest_transcription_text.grid(row=9, column=0, columnspan=2, padx=5, pady=5, sticky="nsew")
 
         # ウィンドウサイズの調整
         self.master.columnconfigure(1, weight=1)
         self.master.rowconfigure(7, weight=1)
         self.master.rowconfigure(9, weight=1)
 
-    def run_async_loop(self):
-        asyncio.set_event_loop(self.loop)
-        self.loop.run_forever()
+        self.set_settings_enabled(True)
 
-    def onClose(self):
-        save_config(self.getConfigData())
+    def on_close(self) -> None:
+        if self.is_closed:
+            return
+        self.is_closed = True
+        try:
+            self.save_config(self.get_config_data())
+        except OSError as e:
+            # 設定を保存できなくても、マイクの解放と終了は続ける
+            print(f"設定を保存できませんでした: {e}")
+        self.master.after_cancel(self.poll_job)
+        self.session.stop()
+        # モデルのロード中など録音スレッドがすぐに終わらない場合は、PortAudioの解放をOSに任せて終了する
+        if self.session.wait_audio_released(AUDIO_RELEASE_TIMEOUT_SECONDS):
+            self.audio_processor.close()
         self.master.destroy()
 
-    def getConfigData(self):
+    def get_config_data(self) -> Dict[str, Any]:
         return {
-            "processingMode": self.processingMode.get(),
-            "apiKey": self.apiKey.get(),
-            "whisperModel": self.whisperModel.get(),
-            "selectedMic": self.selectedMic.get(),
-            "shortcutKey": self.shortcutKey.get()
+            "processingMode": self.processing_mode.get(),
+            "apiKey": self.api_key.get(),
+            "whisperModel": self.whisper_model.get(),
+            "selectedMic": self.selected_mic.get(),
+            "shortcutKey": self.shortcut_key.get(),
         }
 
-    def onProcessingModeChange(self, event):
-        if self.processingMode.get() == "api":
-            self.apiKeyEntry.config(state="normal")
-            self.whisperModelCombo.config(state="disabled")
+    def on_processing_mode_change(self, event: Any = None) -> None:
+        self.set_settings_enabled(True)
+
+    def set_settings_enabled(self, enabled: bool) -> None:
+        is_api = self.processing_mode.get() == ProcessingMode.API.value
+        self.processing_mode_combo.config(state="readonly" if enabled else "disabled")
+        self.api_key_entry.config(state="normal" if enabled and is_api else "disabled")
+        self.whisper_model_combo.config(state="readonly" if enabled and not is_api else "disabled")
+        self.mic_combo.config(state="readonly" if enabled else "disabled")
+        self.shortcut_key_entry.config(state="normal" if enabled else "disabled")
+
+    def toggle_recognition(self) -> None:
+        if not self.is_recording:
+            self.start_recognition()
         else:
-            self.apiKeyEntry.config(state="disabled")
-            self.whisperModelCombo.config(state="readonly")
+            self.stop_recognition()
 
-    def toggleRecognition(self):
-        if not self.isRecording:
-            self.startRecognition()
+    def start_recognition(self) -> None:
+        try:
+            mode = ProcessingMode(self.processing_mode.get())
+            processor = self.processor_factory.create(mode, self.api_key.get(), WhisperModel(self.whisper_model.get()))
+            self.session.start(
+                RecognitionRequest(
+                    mic_name=self.selected_mic.get(),
+                    shortcut_key=self.shortcut_key.get(),
+                    processor=processor,
+                )
+            )
+        except Exception as e:
+            # 開始できなかった場合は設定を直せるよう、画面を開始前の状態のままにする
+            self.log_message(f"認識を開始できません: {str(e) or type(e).__name__}")
+            return
+
+        self.is_recording = True
+        self.recognition_button.config(text="認識終了")
+        self.set_settings_enabled(False)
+        self.log_message("認識を開始します...")
+        if mode is ProcessingMode.API:
+            api_key = self.processor_factory.resolve_api_key(self.api_key.get())
+            self.log_message(f"APIキー: {mask_api_key(api_key)}")
+
+    def stop_recognition(self) -> None:
+        # 録音スレッドの終了はStoppedEventで受け取り、それまで再開始させない
+        self.recognition_button.config(text="停止処理中...", state="disabled")
+        self.log_message("認識を終了しています...")
+        self.session.stop()
+
+    def poll_events(self) -> None:
+        while True:
+            try:
+                event = self.events.get_nowait()
+            except queue.Empty:
+                break
+            self.handle_event(event)
+        self.poll_job = self.master.after(EVENT_POLL_INTERVAL_MS, self.poll_events)
+
+    def handle_event(self, event: Any) -> None:
+        if isinstance(event, LogEvent):
+            self.log_message(event.message)
+        elif isinstance(event, TranscribedEvent):
+            self.show_transcription(event.text)
+        elif isinstance(event, StoppedEvent):
+            self.finish_recognition(event)
+
+    def show_transcription(self, transcribed_text: str) -> None:
+        self.log_message(f"文字起こし結果: {transcribed_text}")
+
+        # 最新の文字起こし結果を表示
+        self.latest_transcription_text.delete("1.0", tk.END)
+        self.latest_transcription_text.insert(tk.END, transcribed_text)
+
+    def finish_recognition(self, event: StoppedEvent) -> None:
+        self.is_recording = False
+        self.recognition_button.config(text="認識開始", state="normal")
+        if event.error:
+            self.log_message(f"エラーが発生したため認識を終了しました: {event.error}")
         else:
-            self.stopRecognition()
-
-    def startRecognition(self):
-        self.isRecording = True
-        self.recognitionButton.config(text="認識終了")
-        self.logMessage("認識を開始します...")
-
-        # 設定項目を無効化
-        self.processingModeCombo.config(state="disabled")
-        self.apiKeyEntry.config(state="disabled")
-        self.whisperModelCombo.config(state="disabled")
-        self.micCombo.config(state="disabled")
-        self.shortcutKeyEntry.config(state="disabled")
-
-        # 選択されたマイクのインデックスを取得
-        selectedMicName = self.selectedMic.get()
-        inputDeviceIndex = self.audioProcessor.get_input_devices().index(selectedMicName)
-        self.audioProcessor.initialize_stream(inputDeviceIndex)
-
-        # ショートカットキーを設定
-        self.audioProcessor.shortcutKey = self.shortcutKey.get()
-
-        # TranscriptionProcessorの初期化
-        if self.processingMode.get() == "api":
-            apiKey = self.apiKey.get()
-            maskedApiKey = apiKey[:4] + '*' * (len(apiKey) - 8) + apiKey[-4:]
-            self.transcriptionProcessor = APITranscriptionProcessor(apiKey)
-            self.logMessage(f"APIキー: {maskedApiKey}")
-        else:
-            useCuda = self.processingMode.get() == "cuda"
-            selectedModel = WhisperModel(self.whisperModel.get())
-            self.transcriptionProcessor = LocalTranscriptionProcessor(useCuda, selectedModel)
-            self.logMessage(f"モデル '{selectedModel.value}' をロード中です。しばらくお待ちください...")
-            threading.Thread(target=self.loadModelInBackground).start()
-
-        # ショートカットキーの監視を開始
-        self.checkShortcutAndRecord()
-
-    def loadModelInBackground(self):
-        self.transcriptionProcessor.loadModel()
-        self.logMessage("モデルのロードが完了しました。")
-
-    def stopRecognition(self):
-        self.isRecording = False
-        self.recognitionButton.config(text="認識開始")
-        self.logMessage("認識を終了しました")
+            self.log_message("認識を終了しました")
 
         # 設定項目を有効化
-        self.processingModeCombo.config(state="readonly")
-        self.apiKeyEntry.config(state="normal" if self.processingMode.get() == "api" else "disabled")
-        self.whisperModelCombo.config(state="readonly" if self.processingMode.get() != "api" else "disabled")
-        self.micCombo.config(state="readonly")
-        self.shortcutKeyEntry.config(state="normal")
+        self.set_settings_enabled(True)
 
-    def checkShortcutAndRecord(self):
-        if self.isRecording:
-            if keyboard.is_pressed(self.shortcutKey.get()):
-                self.logMessage("録音中...")
-                frames = self.audioProcessor.record_audio()
-                self.logMessage("録音終了")
-                
-                if frames:  # フレームが存在する場合のみ処理を行う
-                    self.logMessage("文字起こしを開始します...")
-                    future = asyncio.run_coroutine_threadsafe(self.processTranscription(frames), self.loop)
-                    future.add_done_callback(self.handle_transcription_result)
-            
-            self.master.after(100, self.checkShortcutAndRecord)
+    def log_message(self, message: str) -> None:
+        self.log_text.config(state="normal")
+        self.log_text.insert(tk.END, message + "\n")
+        self.log_text.see(tk.END)
+        self.log_text.config(state="disabled")
 
-    def handle_transcription_result(self, future):
-        try:
-            result = future.result()
-            self.master.after(0, self.update_gui, result)
-        except Exception as e:
-            self.master.after(0, self.logMessage, f"エラーが発生しました: {str(e)}")
-
-    def update_gui(self, transcribedText):
-        self.logMessage(f"文字起こし結果: {transcribedText}")
-        
-        # 最新の文字起こし結果を表示
-        self.latestTranscriptionText.delete('1.0', tk.END)
-        self.latestTranscriptionText.insert(tk.END, transcribedText)
-        
-        pyperclip.copy(transcribedText)
-        pyautogui.hotkey('ctrl', 'v')
-        activeWindow = pyautogui.getActiveWindow()
-        self.logMessage(f"文字起こし結果を '{activeWindow.title}' に貼り付けました")
-
-    async def processTranscription(self, frames):
-        return await self.transcriptionProcessor.process(frames)
-
-    def logMessage(self, message):
-        self.logText.config(state="normal")
-        self.logText.insert(tk.END, message + "\n")
-        self.logText.see(tk.END)
-        self.logText.config(state="disabled")
-        self.master.update_idletasks()
+    @staticmethod
+    def _choice(value: Any, choices: list, default: str) -> str:
+        return value if value in choices else default

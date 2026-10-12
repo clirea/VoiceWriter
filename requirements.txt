@@ -1,8 +1,8 @@
-tkinter
-pyaudio
-openai-whisper
+PyAudio>=0.2.14
+openai-whisper>=20240930
 torch
-keyboard
-pyautogui
+numpy
+keyboard>=0.13.5
+PyAutoGUI>=0.9.54
 pyperclip
-openai
+openai>=1.0
